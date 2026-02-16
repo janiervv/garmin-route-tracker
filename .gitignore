@@ -1,0 +1,9 @@
+venv/
+routes.geojson
+.garmin_session
+.garmin_tokens/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+.vscode/

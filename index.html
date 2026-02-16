@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Running Routes</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+
+    #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 1; }
+
+    #controls {
+      position: absolute; top: 12px; right: 12px; z-index: 1000;
+      background: white; border-radius: 8px; padding: 16px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15); width: 280px;
+      max-height: calc(100vh - 24px); overflow-y: auto;
+      font-size: 14px;
+    }
+    #controls h2 { font-size: 16px; margin-bottom: 12px; }
+    #controls label { display: block; margin-top: 10px; font-weight: 600; font-size: 12px; color: #555; }
+    #controls input, #controls select {
+      width: 100%; padding: 6px 8px; margin-top: 4px;
+      border: 1px solid #ddd; border-radius: 4px; font-size: 13px;
+    }
+    #stats {
+      margin-top: 14px; padding-top: 12px; border-top: 1px solid #eee;
+      font-size: 12px; color: #666; line-height: 1.6;
+    }
+    #stats strong { color: #333; }
+
+    .info-popup .popup-title { font-weight: 700; font-size: 14px; margin-bottom: 6px; }
+    .info-popup .popup-row { font-size: 12px; color: #444; line-height: 1.8; }
+    .info-popup .popup-row span { font-weight: 600; color: #111; }
+
+    .legend {
+      margin-top: 14px; padding-top: 12px; border-top: 1px solid #eee;
+    }
+    .legend-title { font-weight: 600; font-size: 12px; color: #555; margin-bottom: 6px; }
+    .legend-bar {
+      height: 12px; border-radius: 3px; margin-bottom: 4px;
+    }
+    .legend-labels { display: flex; justify-content: space-between; font-size: 11px; color: #888; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls">
+    <h2>Running Routes</h2>
+
+    <label>From date</label>
+    <input type="date" id="dateFrom">
+
+    <label>To date</label>
+    <input type="date" id="dateTo">
+
+    <label>Min distance (km)</label>
+    <input type="number" id="distMin" placeholder="0" min="0" step="0.5">
+
+    <label>Max distance (km)</label>
+    <input type="number" id="distMax" placeholder="∞" min="0" step="0.5">
+
+    <label>Color by</label>
+    <select id="colorMode">
+      <option value="heatmap">Heatmap (frequency)</option>
+      <option value="pace">Pace (min/km)</option>
+      <option value="date">Date</option>
+      <option value="distance">Distance</option>
+    </select>
+
+    <div id="stats"></div>
+
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([51.505, -0.09], 12);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+      maxZoom: 19,
+    }).addTo(map);
+
+    let allFeatures = [];
+    let routeLayers = [];
+    let highlightLayer = null;
+
+    // --- Color utilities ---
+    function hslToHex(h, s, l) {
+      s /= 100; l /= 100;
+      const a = s * Math.min(l, 1 - l);
+      const f = n => {
+        const k = (n + h / 30) % 12;
+        const color = l - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+        return Math.round(255 * color).toString(16).padStart(2, '0');
+      };
+      return `#${f(0)}${f(8)}${f(4)}`;
+    }
+
+    function paceToMinutes(paceStr) {
+      const parts = paceStr.split(':');
+      return parseInt(parts[0]) + parseInt(parts[1]) / 60;
+    }
+
+    // --- Segment overlap counting for heatmap ---
+    function buildSegmentCounts(features) {
+      const counts = new Map();
+      const precision = 4; // ~11m resolution
+      for (const f of features) {
+        const coords = f.geometry.coordinates;
+        for (let i = 0; i < coords.length - 1; i++) {
+          const a = `${coords[i][0].toFixed(precision)},${coords[i][1].toFixed(precision)}`;
+          const b = `${coords[i+1][0].toFixed(precision)},${coords[i+1][1].toFixed(precision)}`;
+          // Normalize direction so both directions map to same key
+          const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+          counts.set(key, (counts.get(key) || 0) + 1);
+        }
+      }
+      return counts;
+    }
+
+    function getSegmentCount(counts, c1, c2, precision = 4) {
+      const a = `${c1[0].toFixed(precision)},${c1[1].toFixed(precision)}`;
+      const b = `${c2[0].toFixed(precision)},${c2[1].toFixed(precision)}`;
+      const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+      return counts.get(key) || 1;
+    }
+
+    function maxMapValue(map) {
+      let max = 1;
+      for (const v of map.values()) { if (v > max) max = v; }
+      return max;
+    }
+
+    // --- Filtering ---
+    function getFilteredFeatures() {
+      const dateFrom = document.getElementById('dateFrom').value;
+      const dateTo = document.getElementById('dateTo').value;
+      const distMin = parseFloat(document.getElementById('distMin').value) || 0;
+      const distMax = parseFloat(document.getElementById('distMax').value) || Infinity;
+
+      return allFeatures.filter(f => {
+        const p = f.properties;
+        if (dateFrom && p.date < dateFrom) return false;
+        if (dateTo && p.date > dateTo) return false;
+        if (p.distance_km < distMin) return false;
+        if (p.distance_km > distMax) return false;
+        return true;
+      });
+    }
+
+    // --- Rendering ---
+    function renderRoutes() {
+      // Clear existing
+      routeLayers.forEach(l => map.removeLayer(l));
+      routeLayers = [];
+      if (highlightLayer) { map.removeLayer(highlightLayer); highlightLayer = null; }
+
+      const features = getFilteredFeatures();
+      const colorMode = document.getElementById('colorMode').value;
+
+      if (features.length === 0) {
+        updateStats(features);
+        updateLegend(colorMode, features);
+        return;
+      }
+
+      if (colorMode === 'heatmap') {
+        renderHeatmap(features);
+      } else {
+        renderColored(features, colorMode);
+      }
+
+      updateStats(features);
+      updateLegend(colorMode, features);
+    }
+
+    function renderHeatmap(features) {
+      const segCounts = buildSegmentCounts(features);
+      const maxCount = maxMapValue(segCounts);
+
+      for (const feature of features) {
+        const coords = feature.geometry.coordinates;
+        for (let i = 0; i < coords.length - 1; i++) {
+          const count = getSegmentCount(segCounts, coords[i], coords[i + 1]);
+          const intensity = count / maxCount;
+          // Blue (cold) → Cyan → Yellow → Red (hot)
+          const hue = (1 - intensity) * 240;
+          const color = hslToHex(hue, 100, 50);
+          const opacity = 0.3 + intensity * 0.7;
+
+          const seg = L.polyline(
+            [[coords[i][1], coords[i][0]], [coords[i + 1][1], coords[i + 1][0]]],
+            { color, weight: 2 + intensity * 3, opacity }
+          );
+          seg.addTo(map);
+          routeLayers.push(seg);
+        }
+
+        // Invisible wide polyline for hover interaction
+        const latlngs = coords.map(c => [c[1], c[0]]);
+        const hoverLine = L.polyline(latlngs, { weight: 16, opacity: 0, color: 'transparent' });
+        hoverLine.addTo(map);
+        routeLayers.push(hoverLine);
+        attachPopup(hoverLine, feature);
+        attachHover(hoverLine, feature);
+      }
+    }
+
+    function renderColored(features, mode) {
+      let values, minVal, maxVal;
+
+      if (mode === 'pace') {
+        values = features.map(f => paceToMinutes(f.properties.pace));
+      } else if (mode === 'date') {
+        values = features.map(f => new Date(f.properties.date).getTime());
+      } else {
+        values = features.map(f => f.properties.distance_km);
+      }
+
+      minVal = Math.min(...values);
+      maxVal = Math.max(...values);
+      const range = maxVal - minVal || 1;
+
+      features.forEach((feature, idx) => {
+        const t = (values[idx] - minVal) / range;
+        // For pace: lower is faster, so invert (fast=red, slow=blue)
+        const normalized = mode === 'pace' ? 1 - t : t;
+        const hue = normalized * 240; // 0=red → 240=blue
+        const color = hslToHex(hue, 85, 50);
+
+        const latlngs = feature.geometry.coordinates.map(c => [c[1], c[0]]);
+        const line = L.polyline(latlngs, { color, weight: 2.5, opacity: 0.65 });
+        line.addTo(map);
+        routeLayers.push(line);
+        attachPopup(line, feature);
+        attachHover(line, feature);
+      });
+    }
+
+    function attachPopup(layer, feature) {
+      const p = feature.properties;
+      layer.bindPopup(`
+        <div class="info-popup">
+          <div class="popup-title">${p.name}</div>
+          <div class="popup-row">Date: <span>${p.date}</span></div>
+          <div class="popup-row">Distance: <span>${p.distance_km} km</span></div>
+          <div class="popup-row">Duration: <span>${p.duration_min} min</span></div>
+          <div class="popup-row">Pace: <span>${p.pace} min/km</span></div>
+          <div class="popup-row">Avg speed: <span>${p.avg_speed_kmh} km/h</span></div>
+        </div>
+      `);
+    }
+
+    function attachHover(layer, feature) {
+      const p = feature.properties;
+      layer.bindTooltip(
+        `<strong>${p.name}</strong><br>${p.date} &middot; ${p.distance_km} km &middot; ${p.pace} min/km`,
+        { sticky: true, direction: 'top', offset: [0, -10] }
+      );
+      layer.on('mouseover', function () {
+        if (highlightLayer) map.removeLayer(highlightLayer);
+        const latlngs = feature.geometry.coordinates.map(c => [c[1], c[0]]);
+        highlightLayer = L.polyline(latlngs, { color: '#fff', weight: 5, opacity: 0.9 });
+        highlightLayer.addTo(map);
+      });
+      layer.on('mouseout', function () {
+        if (highlightLayer) { map.removeLayer(highlightLayer); highlightLayer = null; }
+      });
+    }
+
+    // --- Stats ---
+    function updateStats(features) {
+      const el = document.getElementById('stats');
+      if (features.length === 0) {
+        el.innerHTML = 'No routes match the current filters.';
+        return;
+      }
+      const totalKm = features.reduce((s, f) => s + f.properties.distance_km, 0);
+      const totalMin = features.reduce((s, f) => s + f.properties.duration_min, 0);
+      const avgPace = totalMin / totalKm;
+      const pMin = Math.floor(avgPace);
+      const pSec = Math.round((avgPace - pMin) * 60);
+
+      el.innerHTML = `
+        <strong>${features.length}</strong> runs<br>
+        Total <strong>${totalKm.toFixed(1)} km</strong><br>
+        Total <strong>${Math.round(totalMin)} min</strong> (${(totalMin / 60).toFixed(1)} h)<br>
+        Avg pace <strong>${pMin}:${pSec.toString().padStart(2, '0')} min/km</strong>
+      `;
+    }
+
+    // --- Legend ---
+    function updateLegend(mode, features) {
+      const el = document.getElementById('legend');
+      if (features.length === 0) { el.innerHTML = ''; return; }
+
+      let title, leftLabel, rightLabel, gradient;
+
+      if (mode === 'heatmap') {
+        title = 'Frequency';
+        leftLabel = 'Rare'; rightLabel = 'Frequent';
+        gradient = 'linear-gradient(to right, hsl(240,100%,50%), hsl(180,100%,50%), hsl(60,100%,50%), hsl(0,100%,50%))';
+      } else if (mode === 'pace') {
+        title = 'Pace';
+        const paces = features.map(f => paceToMinutes(f.properties.pace));
+        const fast = Math.min(...paces), slow = Math.max(...paces);
+        leftLabel = `${Math.floor(fast)}:${Math.round((fast % 1) * 60).toString().padStart(2, '0')}`;
+        rightLabel = `${Math.floor(slow)}:${Math.round((slow % 1) * 60).toString().padStart(2, '0')}`;
+        gradient = 'linear-gradient(to right, hsl(240,85%,50%), hsl(120,85%,50%), hsl(0,85%,50%))';
+      } else if (mode === 'date') {
+        title = 'Date';
+        const dates = features.map(f => f.properties.date).sort();
+        leftLabel = dates[0]; rightLabel = dates[dates.length - 1];
+        gradient = 'linear-gradient(to right, hsl(0,85%,50%), hsl(120,85%,50%), hsl(240,85%,50%))';
+      } else {
+        title = 'Distance';
+        const dists = features.map(f => f.properties.distance_km);
+        leftLabel = `${Math.min(...dists)} km`; rightLabel = `${Math.max(...dists)} km`;
+        gradient = 'linear-gradient(to right, hsl(0,85%,50%), hsl(120,85%,50%), hsl(240,85%,50%))';
+      }
+
+      el.innerHTML = `
+        <div class="legend-title">${title}</div>
+        <div class="legend-bar" style="background: ${gradient};"></div>
+        <div class="legend-labels"><span>${leftLabel}</span><span>${rightLabel}</span></div>
+      `;
+    }
+
+    // --- Load data ---
+    fetch('routes.geojson')
+      .then(r => {
+        if (!r.ok) throw new Error('routes.geojson not found — run fetch_runs.py first.');
+        return r.json();
+      })
+      .then(data => {
+        allFeatures = data.features || [];
+        // Sort by date ascending
+        allFeatures.sort((a, b) => (a.properties.date || '').localeCompare(b.properties.date || ''));
+        renderRoutes();
+
+        // Routes loaded, render with default home view
+      })
+      .catch(err => {
+        document.getElementById('stats').innerHTML = `<span style="color: #e74c3c;">${err.message}</span>`;
+      });
+
+    // --- Filter event listeners ---
+    ['dateFrom', 'dateTo', 'distMin', 'distMax', 'colorMode'].forEach(id => {
+      document.getElementById(id).addEventListener('change', renderRoutes);
+    });
+  </script>
+</body>
+</html>
